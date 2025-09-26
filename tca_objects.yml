@@ -1,0 +1,794 @@
+# ---------------------------------------------------------------------------
+# Template objects definition for Teradata MCP Server
+#
+# Usage:
+# - Define custom tools, prompts, cubes, or glossary entries for dynamic registration.
+# - Each object is a top-level key; its value is a dictionary describing the object.
+#
+# Supported object types:
+#   type: tool      # SQL-based tool, requires 'sql' and 'parameters'
+#   type: prompt    # Prompt for LLM, requires 'prompt'
+#   type: cube      # Aggregation cube, requires 'sql', 'dimensions', 'measures'
+#   type: glossary  # Glossary entry, requires 'definition', optional 'synonyms'
+#
+# Required fields by type:
+#   tool:     type, description, sql, parameters
+#   prompt:   type, description, prompt
+#   cube:     type, description, sql, dimensions, measures
+#   glossary: type, definition, [synonyms]
+#
+# Example:
+# myCustomTool:
+#   type: tool
+#   description: "Returns top 10 customers by revenue."
+#   sql: "SELECT customer_id, SUM(revenue) FROM sales GROUP BY customer_id ORDER BY SUM(revenue) DESC LIMIT 10"
+#   parameters:
+#     start_date: {type_hint: str, required: true}
+#     end_date: {type_hint: str, required: true}
+#
+# myPrompt:
+#   type: prompt
+#   description: "Prompt for summarizing sales data."
+#   prompt: "Summarize the sales data for the last quarter."
+#
+# ---------------------------------------------------------------------------
+
+#sales_prompt:
+#  type: prompt
+#  description: "my prompt description"
+#  prompt: |
+#    You are a data analyst working for a sales team.
+#    Your task is to analyze the sales data using the tools you have and provide insights.
+#    All your answers must be based on the data you retrieve using the tools, and you must be ready to provide data for your answers.
+
+
+# ==================================================================================
+# Get all industries available
+tca_industryList:
+  type: tool
+  description: "Get list of all available industries with customer counts and TCA activity"
+  sql: |
+    select distinct 
+        snow.sls_industry_desc as industry,
+        count(distinct snow.gtm_acct_name) as customer_count,
+        sum(case when snow.tca_actv_ind = 1 then 1 else 0 end) as tca_active_count,
+        
+        -- Calculate TCA adoption percentage
+        round(
+            (sum(case when snow.tca_actv_ind = 1 then 1 else 0 end) * 100.0) / 
+            count(distinct snow.gtm_acct_name), 
+            1
+        ) as tca_adoption_pct
+        
+    from ACC_TED_CON_VW.dbp_snow_site_dim snow
+    
+    where snow.status_desc IN ( 'Active', 'Operational' )
+    and snow.gtm_acct_name IS NOT NULL
+    and snow.sls_industry_desc IS NOT NULL
+    
+    group by snow.sls_industry_desc
+    
+    order by 
+        tca_active_count desc,    -- Industries with most TCA active customers first
+        customer_count desc       -- Then by total customer count
+        ;
+
+# ==================================================================================
+tca_customerSearch:
+  type: tool
+  description: "Smart customer search with fuzzy name matching"
+  sql: |
+    SELECT DISTINCT
+        snow.gtm_acct_name AS account_name,
+        -- snow.acct_nbr AS account_nbr,
+        snow.gtm_acct_nbr AS account_nbr,
+        snow.sls_hier_lvl_1 AS territory,
+        snow.sls_industry_desc AS industry_desc,
+        CASE WHEN snow.tca_actv_ind = 1 THEN 'Y' ELSE 'N' END AS tca_active_ind,
+        
+        -- Enhanced relevance scoring using EDITDISTANCE with punctuation normalization
+        CASE
+            WHEN UPPER(snow.gtm_acct_name) = UPPER(:search_term) THEN 100
+            -- Normalize by removing common punctuation for better matching
+            WHEN UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')) = 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', '')) THEN 98
+            
+            -- Compare normalized strings with EDITDISTANCE
+            WHEN EDITDISTANCE(
+                UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+            ) <= 1 THEN 95
+            WHEN EDITDISTANCE(
+                UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+            ) <= 2 THEN 90
+            WHEN EDITDISTANCE(
+                UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+            ) <= 3 THEN 85
+            WHEN EDITDISTANCE(
+                UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+            ) <= 4 THEN 80
+            WHEN EDITDISTANCE(
+                UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+                UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+            ) <= 5 THEN 77
+            
+            -- Original string comparisons for fallback
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 1 THEN 92
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 2 THEN 87
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 3 THEN 82
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 4 THEN 80
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 5 THEN 75
+            WHEN EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 6 THEN 70
+            
+            -- Traditional LIKE patterns for partial matches
+            WHEN UPPER(snow.gtm_acct_name) LIKE UPPER(:search_term || '%') THEN 65
+            WHEN UPPER(snow.gtm_acct_name) LIKE UPPER('%' || :search_term || '%') THEN 60
+            ELSE 0
+        END AS relevance_score,
+        
+        -- Include normalized edit distance for debugging
+        EDITDISTANCE(
+            UPPER(OREPLACE(OREPLACE(OREPLACE(snow.gtm_acct_name, '''', ''), '.', ''), ',', '')), 
+            UPPER(OREPLACE(OREPLACE(OREPLACE(:search_term, '''', ''), '.', ''), ',', ''))
+        ) AS normalized_edit_distance
+
+    FROM ACC_TED_CON_VW.dbp_snow_site_dim snow
+
+    WHERE snow.status_desc IN ( 'Active', 'Operational' )
+        AND snow.gtm_acct_name IS NOT NULL
+        AND (
+            -- Exact match
+            UPPER(snow.gtm_acct_name) = UPPER(:search_term)
+            -- Fuzzy match within reasonable edit distance
+            OR EDITDISTANCE(UPPER(snow.gtm_acct_name), UPPER(:search_term)) <= 6
+            -- Traditional substring match for broader coverage
+            OR UPPER(snow.gtm_acct_name) LIKE UPPER('%' || :search_term || '%')
+        )
+
+    ORDER BY relevance_score DESC, normalized_edit_distance ASC, snow.gtm_acct_name;
+
+  parameters:
+    search_term:
+      description: "Customer name to search for (supports partial matching)"
+
+# tca_customerSearch:
+#   type: tool
+#   description: "Smart customer search with fuzzy name matching"
+#   sql: |
+#     select distinct 
+#       snow.gtm_acct_name as account_name, 
+#       snow.acct_nbr as account_nbr, 
+#       snow.sls_hier_lvl_1 as territory, 
+#       snow.sls_industry_desc as industry_desc,
+#       case when snow.tca_actv_ind = 1 then 'Y' else 'N' end as tca_active_ind,
+      
+#       -- Simple relevance scoring using basic LIKE matching
+#       case 
+#           when UPPER(snow.gtm_acct_name) = UPPER(:search_term) then 100
+#           when UPPER(snow.gtm_acct_name) LIKE UPPER(:search_term || '%') then 90
+#           when UPPER(snow.gtm_acct_name) LIKE UPPER('%' || :search_term || '%') then 80
+#         else 0
+#       end as relevance_score
+            
+#     from ACC_TED_CON_VW.dbp_snow_site_dim snow
+
+#     where snow.status_desc = 'Active'
+#     and snow.gtm_acct_name IS NOT NULL
+#     and UPPER(snow.gtm_acct_name) LIKE UPPER('%' || :search_term || '%')
+
+#     order by relevance_score desc, snow.gtm_acct_name
+    
+#   parameters:
+#     search_term:
+#       description: "Customer name to search for (supports partial matching)"
+
+
+# ==================================================================================
+
+# tca_customerList:
+#   type: tool
+#   description: "Fetch list of customers globally or by Region / Industry"
+#   sql: |
+#     select distinct snow.gtm_acct_name as account_name, 
+#         snow.acct_nbr as account_nbr, 
+#         snow.sls_hier_lvl_1 as territory, 
+#         snow.sls_industry_desc as industry_desc,
+#         case when snow.tca_actv_ind = 1 then 'Y' else 'N' end as tca_active_ind
+        
+#     from ACC_TED_CON_VW.dbp_snow_site_dim snow
+
+#     where snow.status_desc = 'Active'
+#     and snow.sls_hier_lvl_1 = 'Americas Industries'
+#     and snow.gtm_acct_name IS NOT NULL
+#     and snow.sls_industry_desc = 'Retail'
+#     order by snow.gtm_acct_name ;
+
+# ==================================================================================
+
+tca_customerList:
+  type: tool
+  description: "Fetch list of customers with optional industry filtering"
+  sql: |
+    select distinct 
+        snow.gtm_acct_name as account_name, 
+        -- snow.acct_nbr as account_nbr, 
+        snow.gtm_acct_nbr AS account_nbr
+        snow.sls_hier_lvl_1 as territory, 
+        snow.sls_industry_desc as industry_desc,
+        case when snow.tca_actv_ind = 1 then 'Y' else 'N' end as tca_active_ind,
+        
+        -- Simple industry relevance scoring
+        case 
+            when :industry IS NULL then 100
+            when UPPER(snow.sls_industry_desc) = UPPER(:industry) then 100
+            when UPPER(snow.sls_industry_desc) LIKE UPPER(:industry || '%') then 90
+            when UPPER(snow.sls_industry_desc) LIKE UPPER('%' || :industry || '%') then 80
+            else 0
+        end as industry_relevance_score
+        
+    from ACC_TED_CON_VW.dbp_snow_site_dim snow
+
+    where snow.status_desc IN ( 'Active', 'Operational' )
+    and snow.gtm_acct_name IS NOT NULL
+    and (
+        :industry IS NULL 
+        OR UPPER(snow.sls_industry_desc) LIKE UPPER('%' || :industry || '%')
+    )
+    
+    order by 
+        industry_relevance_score desc,
+        case when snow.tca_actv_ind = 1 then 0 else 1 end,  -- TCA active first
+        snow.gtm_acct_name
+        
+  parameters:
+    industry:
+      description: "Optional industry to filter by (supports partial matching). Examples: retail, financial, healthcare, manufacturing. Leave empty to get all customers."
+
+# ==================================================================================
+
+tca_siteList:
+  type: tool
+  description: "Fetch the active Teradata sites for the customer being queried"
+  sql: |
+    with sites as (
+     select cust_site_id, max(measure_dt) as measure_dt
+     from ACC_TED_CON_VW.dbp_snow_site_agg_dly
+     where status_desc IN ( 'Active', 'Operational' )
+     -- and sys_family_desc IS NOT NULL
+     group by 1
+    )
+    select snow.gtm_acct_name, 
+      -- snow.acct_nbr, 
+      snow.gtm_acct_nbr AS account_nbr,
+      snow.sls_hier_lvl_1, 
+      snow.sls_industry_desc, 
+      snow.cust_site_id, 
+      snow2.pltfrm_type_desc, 
+      snow.sys_use_desc, 
+      CASE WHEN snow2.sys_family_desc = 'FAMILY_7000' then 'IntelliFlex 1.0'
+        WHEN snow2.sys_family_desc = 'FAMILY_7001' then 'IntelliFlex 1.1'
+        WHEN snow2.sys_family_desc = 'FAMILY_7010' then 'IntelliFlex 2.0'
+        WHEN snow2.sys_family_desc = 'FAMILY_7011' then 'IntelliFlex 2.1'
+        WHEN snow2.sys_family_desc = 'FAMILY_7025' then 'IntelliFlex 2.5'
+        WHEN snow2.sys_family_desc LIKE 'FAMILY_6800%' THEN '6800'
+        WHEN snow2.sys_family_desc LIKE '%2700%' THEN '2700'
+        WHEN snow2.sys_family_desc LIKE '%2750%' THEN '2750'
+        ELSE snow2.sys_family_desc
+        END AS system_family,
+
+      case when snow.tca_actv_ind = 1 then 'Y' else 'N' end as tca_active_ind,
+        
+      snow2.tpa_node_cnt, 
+      snow2.tpa_amp_cnt, 
+      snow2.tot_cpu_cnt, 
+      snow2.cpu_os_core_cnt, 
+      snow2.tot_mem_mb_qty,
+        
+      sites.measure_dt
+        
+    from ACC_TED_CON_VW.dbp_snow_site_dim snow
+    INNER JOIN sites ON snow.cust_site_id = sites.cust_site_id
+        
+    INNER JOIN ACC_TED_CON_VW.dbp_snow_site_agg_dly snow2
+      ON sites.cust_site_id = snow2.cust_site_id
+      and sites.measure_dt = snow2.measure_dt
+              
+    where snow.status_desc IN ( 'Active', 'Operational' )
+    and snow.gtm_acct_nbr = :account_nbr
+    order by snow.gtm_acct_name, snow.cust_site_id ;
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+
+# ==================================================================================
+
+tca_databaseCounts:
+  type: tool
+  description: "Fetch the count of users and databases for the given site id"
+  sql: |
+    with join_date as (
+      select db.cust_site_id, max(db.log_dt) as max_log_dt 
+      from ACC_TED_CON_VW.dbp_db_user_cnt db 
+          INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+          ON db.cust_site_id = snow.cust_site_id
+      where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+      and snow.gtm_acct_nbr = :account_nbr
+      and snow.status_desc IN ( 'Active', 'Operational' )
+      group by 1
+    )
+    select cust_site_id, 
+      max(case when db_type_cd = 'U' then db_cnt else NULL end) as user_count,
+      max(case when db_type_cd = 'D' then db_cnt else NULL end) as db_count
+    from (
+      select db.log_dt, db.cust_site_id, db.db_type_cd, db.db_cnt
+      from ACC_TED_CON_VW.dbp_db_user_cnt db
+        INNER JOIN join_date 
+        ON db.log_dt = join_date.max_log_dt
+        AND db.cust_site_id = join_date.cust_site_id
+    ) tbl
+    group by 1 ;
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+    cust_site_id:
+      description: "Teradata site id for the customer site"
+
+# ==================================================================================
+
+tca_databaseSpace:
+  type: tool
+  description: "Fetch the space consumed and table count across all the databases at the site"
+  sql: |
+    with join_date as (
+        select db.cust_site_id, max(db.log_dt) as max_log_dt 
+        from ACC_TED_CON_VW.dbp_cust_data_space db 
+            INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+            ON db.cust_site_id = snow.cust_site_id
+        where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+        and snow.gtm_acct_nbr = :account_nbr
+        and snow.status_desc IN ( 'Active', 'Operational' )
+        group by 1
+    )
+    select db.cust_site_id,
+      db.log_dt, 
+      db.table_cnt, 
+      db.ttl_cur_perm_without_fallback_qty,
+      db.ttl_cds_consumed_bytes_qty 
+    from ACC_TED_CON_VW.dbp_cust_data_space db
+      INNER JOIN join_date 
+      ON db.log_dt = join_date.max_log_dt 
+      AND db.cust_site_id = join_date.cust_site_id ;
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+    cust_site_id:
+      description: "Teradata site id for the customer site"
+
+# ==================================================================================
+
+# tca_siteDBQLStats:
+#   type: tool
+#   description: "Get daily / hourly usage statistics from the site for 30 days"
+#   sql: |
+#     with join_date as (
+#         select db.cust_site_id, max(db.log_dt) as max_log_dt 
+#         from ACC_TED_CON_VW.dbp_dbql_logtbl_agg_hrly db 
+#             INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+#             ON db.cust_site_id = snow.cust_site_id
+#         where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+#         and snow.acct_nbr = :account_nbr
+#         and snow.status_desc = 'Active'
+#         group by 1
+#     )
+#     select dbql.cust_site_id, 
+#         dbql.log_dt, 
+#         dbql.log_hr, 
+#         dbql.appl_id, 
+#         sum(qry_cnt) as qry_cnt, 
+#         sum(stmt_cnt) as stmt_cnt, 
+#         sum(amp_cpu_tm_sec_qty) as tot_ampcputime, 
+#         sum(impact_cpu_sec_qty) as tot_impactcputime,
+#         sum(rslt_row_cnt) as tot_result_rows
+        
+#     from ACC_TED_CON_VW.dbp_dbql_logtbl_agg_hrly dbql
+#         INNER JOIN join_date dt
+#               ON dbql.cust_site_id = dt.cust_site_id
+#               AND dbql.log_dt between dt.max_log_dt - 30 and dt.max_log_dt 
+#     group by 1, 2, 3, 4
+#     order by 1, 2, 3, 4 ;
+#   parameters:
+#     account_nbr:
+#       description: "GTM account number for the account to search in TCA"
+#     cust_site_id:
+#       description: "Teradata site id for the customer site"
+
+# ==================================================================================
+
+tca_siteDBQLStatsCube:
+  type: cube
+  description: "Query workload and performance metrics cube - aggregated for business analysis and heatmaps"
+  
+  dimensions:
+    cust_site_id:
+      type: string
+      description: "Customer site identifier"
+      expression: "cust_site_id"
+    day_of_week:
+      type: string
+      description: "Day of week (Sun, Mon, Tue, Wed, Thu, Fri, Sat)"
+      expression: "day_of_week"
+    hour_of_day:
+      type: integer
+      description: "Hour of day (0-23)"
+      expression: "hour_of_day"
+    workload_tier:
+      type: string
+      description: "Load classification based on query volume"
+      expression: "CASE WHEN qry_cnt >= 1000 THEN 'High Load' WHEN qry_cnt >= 100 THEN 'Medium Load' WHEN qry_cnt >= 10 THEN 'Low Load' ELSE 'Minimal Load' END"
+      
+  measures:
+    total_queries:
+      type: integer
+      description: "Total number of queries executed"
+      expression: "SUM(qry_cnt)"
+    active_applications:
+      type: integer
+      description: "Count of distinct applications active"
+      expression: "COUNT(DISTINCT appl_id)"
+    total_amp_cpu_seconds:
+      type: decimal
+      description: "Total AMP CPU time consumed"
+      expression: "SUM(amp_cpu_tm_sec_qty)"
+    total_impact_cpu_seconds:
+      type: decimal
+      description: "Total impact CPU time"
+      expression: "SUM(impact_cpu_sec_qty)"
+    total_result_rows:
+      type: integer
+      description: "Total rows returned by queries"
+      expression: "SUM(rslt_row_cnt)"
+    avg_queries_per_app:
+      type: decimal
+      description: "Average queries per application"
+      expression: "AVG(qry_cnt)"
+    avg_cpu_per_query:
+      type: decimal
+      description: "Average CPU seconds per query"
+      expression: "CAST(SUM(amp_cpu_tm_sec_qty) / NULLIF(SUM(qry_cnt), 0) AS DECIMAL(10,4))"
+    days_sampled:
+      type: integer
+      description: "Number of distinct days in the sample"
+      expression: "COUNT(DISTINCT log_dt)"
+
+  sql: |
+    with join_date as (
+        select db.cust_site_id, max(db.log_dt) as max_log_dt 
+        from ACC_TED_CON_VW.dbp_dbql_logtbl_agg_hrly db 
+            INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+            ON db.cust_site_id = snow.cust_site_id
+        where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+        and snow.gtm_acct_nbr = :account_nbr
+        and snow.status_desc IN ( 'Active', 'Operational' )
+        group by 1
+    )
+    select 
+        dbql.cust_site_id,
+        CASE TD_DAY_OF_WEEK(dbql.log_dt)
+            WHEN 1 THEN 'Sun'
+            WHEN 2 THEN 'Mon'
+            WHEN 3 THEN 'Tue'
+            WHEN 4 THEN 'Wed'
+            WHEN 5 THEN 'Thu'
+            WHEN 6 THEN 'Fri'
+            WHEN 7 THEN 'Sat'
+        END AS day_of_week,
+        dbql.log_hr as hour_of_day,
+        dbql.log_dt,
+        dbql.qry_cnt,
+        dbql.appl_id,
+        dbql.amp_cpu_tm_sec_qty,
+        dbql.impact_cpu_sec_qty,
+        dbql.rslt_row_cnt
+    from ACC_TED_CON_VW.dbp_dbql_logtbl_agg_hrly dbql
+        INNER JOIN join_date dt
+              ON dbql.cust_site_id = dt.cust_site_id
+              AND dbql.log_dt between dt.max_log_dt - 29 and dt.max_log_dt
+
+    where dbql.amp_cpu_tm_sec_qty > 0
+    
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+    cust_site_id:
+      description: "Teradata site id for the customer site (optional - NULL for all sites)"
+
+# ==================================================================================
+
+# tca_siteFeatureUsage:
+#   type: tool
+#   description: "Get daily feature usage for a site, grouped by feature type, for 30 days"
+#   sql: |
+#     with join_date as (
+#         select db.cust_site_id, max(db.log_dt) as max_log_dt 
+#         from ACC_TED_CON_VW.dbp_featusg_agg_dly db 
+#             INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+#             ON db.cust_site_id = snow.cust_site_id
+#         where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+#         and snow.acct_nbr = :account_nbr
+#         and snow.status_desc = 'Active'
+#         group by 1
+#     )
+#     select feats.acct_nbr, 
+#         feats.acct_name, 
+#         feats.cust_site_id, 
+#         feats.log_dt, 
+#         feats.feat_id, 
+#         feats.feat_name, 
+        
+#         feats_dim.product_name,
+#         feats_dim.feature_category,
+#         feats_dim.feature_subcategory,
+#         feats_dim.objective_name,
+#         feats_dim.solution_type,
+#         feats_dim.business_value_desc,
+#         feats_dim.feature_notes,
+        
+#         sum(feats.rqst_ttl_cnt) as request_count
+        
+#     from ACC_TED_CON_VW.dbp_featusg_agg_dly feats
+#         INNER JOIN join_date
+#               ON feats.log_dt between join_date.max_log_dt - 15 and join_date.max_log_dt
+#               and feats.cust_site_id = join_date.cust_site_id
+#         LEFT OUTER JOIN mdm_edw_sub.COA_DIM_FEATURE_VW feats_dim
+#               ON feats.feat_id = feats_dim.feature_id
+
+#     group by 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 ;
+#   parameters:
+#     account_nbr:
+#       description: "GTM account number for the account to search in TCA"
+#     cust_site_id:
+#       description: "Teradata site id for the customer site"
+
+# ==================================================================================
+
+tca_siteFeatureUsageCube:
+  type: cube
+  description: "Feature adoption and usage metrics cube - aggregated for business value analysis"
+  
+  dimensions:
+    cust_site_id:
+      type: string
+      description: "Customer site identifier"
+      expression: "cust_site_id"
+    acct_nbr:
+      type: integer
+      description: "Account number"
+      expression: "acct_nbr"
+    acct_name:
+      type: string
+      description: "Account name"
+      expression: "acct_name"
+    product_name:
+      type: string
+      description: "Teradata product name"
+      expression: "product_name"
+    feature_category:
+      type: string
+      description: "High-level feature category"
+      expression: "feature_category"
+    feature_subcategory:
+      type: string
+      description: "Feature subcategory for detailed analysis"
+      expression: "feature_subcategory"
+    solution_type:
+      type: string
+      description: "Type of solution (Standard, Advanced, etc.)"
+      expression: "solution_type"
+    business_value_category:
+      type: string
+      description: "Business value classification"
+      expression: "business_value_category"
+    usage_tier:
+      type: string
+      description: "Usage classification based on request volume"
+      expression: "CASE WHEN rqst_ttl_cnt >= 10000 THEN 'High Usage' WHEN rqst_ttl_cnt >= 1000 THEN 'Medium Usage' WHEN rqst_ttl_cnt >= 100 THEN 'Low Usage' ELSE 'Minimal Usage' END"
+
+  measures:
+    unique_features_used:
+      type: integer
+      description: "Count of distinct features used in this category"
+      expression: "COUNT(DISTINCT feat_id)"
+    active_days:
+      type: integer
+      description: "Number of days this feature category was active"
+      expression: "COUNT(DISTINCT log_dt)"
+    total_requests:
+      type: integer
+      description: "Total feature requests over 30-day period"
+      expression: "SUM(rqst_ttl_cnt)"
+    avg_daily_requests:
+      type: decimal
+      description: "Average daily requests for this feature category"
+      expression: "AVG(rqst_ttl_cnt)"
+    peak_daily_requests:
+      type: decimal
+      description: "Maximum daily requests recorded"
+      expression: "MAX(rqst_ttl_cnt)"
+    adoption_rate_pct:
+      type: decimal
+      description: "Percentage of days this feature category was used (out of 30 days)"
+      expression: "CAST((COUNT(DISTINCT log_dt) * 100.0 / 30) AS DECIMAL(5,2))"
+
+  sql: |
+    with join_date as (
+        select db.cust_site_id, max(db.log_dt) as max_log_dt 
+        from ACC_TED_CON_VW.dbp_featusg_agg_dly db 
+            INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+            ON db.cust_site_id = snow.cust_site_id
+        where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+        and snow.gtm_acct_nbr = :account_nbr
+        and snow.status_desc IN ( 'Active', 'Operational' )
+        group by 1
+    )
+    select 
+        feats.acct_nbr, 
+        feats.acct_name, 
+        feats.cust_site_id,
+        feats.feat_id,
+        feats.log_dt,
+        feats.rqst_ttl_cnt,
+        coalesce(feats_dim.product_name, 'Unknown Product') as product_name,
+        coalesce(feats_dim.feature_category, 'Uncategorized') as feature_category,
+        coalesce(feats_dim.feature_subcategory, 'General') as feature_subcategory,
+        coalesce(feats_dim.solution_type, 'Standard') as solution_type,
+        coalesce(feats_dim.business_value_desc, 'Operational') as business_value_category
+    from ACC_TED_CON_VW.dbp_featusg_agg_dly feats
+        INNER JOIN join_date
+              ON feats.log_dt between join_date.max_log_dt - 29 and join_date.max_log_dt
+              and feats.cust_site_id = join_date.cust_site_id
+        LEFT OUTER JOIN mdm_edw_sub.COA_DIM_FEATURE_VW feats_dim
+              ON feats.feat_id = feats_dim.feature_id
+    
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+    cust_site_id:
+      description: "Teradata site id for the customer site (optional - NULL for all sites)"
+
+# ==================================================================================
+
+# tca_siteResUsage:
+#   type: tool
+#   description: "Get daily ResUsage stats for a site, including CPU busy and IO utilization, aggregated by date and hour"
+#   sql: |
+#     with join_date as (
+#         select db.cust_site_id, max(db.log_dt) as max_log_dt 
+#         from acc_ted_con_vw.dbp_resUsage_szng_agg db 
+#             INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+#             ON db.cust_site_id = snow.cust_site_id
+#         where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+#         and snow.acct_nbr = :account_nbr
+#         and snow.status_desc = 'Active'
+#         group by 1
+#     )
+#     select sz.cust_site_id, 
+#       sz.log_dt, 
+#       sz.log_dow,
+#       sz.log_hr, 
+#       max(sz.pm_cod_pct) as pm_cod_pct,
+#       max(sz.wm_cod_pct) as wm_cod_pct,
+#       cast(avg(sz.avg_cpu_busy_pct) as decimal(5,2)) as avg_cpu_busy,
+#       cast(max(sz.max_cpu_busy_pct) as decimal(5,2)) as max_cpu_busy,
+#       cast(max(sz.max_iowait_pct) as decimal(5,2)) as max_io_wait
+      
+#     from acc_ted_con_vw.dbp_resUsage_szng_agg sz
+#       INNER JOIN join_date dt
+#       ON sz.log_dt between dt.max_log_dt - 5 and dt.max_log_dt
+#       and sz.cust_site_id = dt.cust_site_id
+
+#     group by 1, 2, 3, 4 ;
+#   parameters:
+#     account_nbr:
+#       description: "GTM account number for the account to search in TCA"
+#     cust_site_id:
+#       description: "Teradata site id for the customer site"
+
+# ==================================================================================
+
+tca_siteResUsageCube:
+  type: cube
+  description: "CPU and IO utilization metrics cube - optimized for heatmaps and business analysis"
+  
+  dimensions:
+    cust_site_id:
+      type: string
+      description: "Customer site identifier"
+      expression: "cust_site_id"
+    day_of_week:
+      type: string
+      description: "Day of week (Sunday, Monday, Tuesday, etc.)"
+      expression: "day_of_week"
+    hour_of_day:
+      type: integer
+      description: "Hour of day (0-23)"
+      expression: "hour_of_day"
+    cpu_load_category:
+      type: string
+      description: "CPU load classification (High, Medium, Low)"
+      expression: "CASE WHEN avg_cpu_busy_pct >= 80 THEN 'High' WHEN avg_cpu_busy_pct >= 50 THEN 'Medium' ELSE 'Low' END"
+
+  measures:
+    avg_cpu_utilization:
+      type: decimal
+      description: "Average CPU busy percentage"
+      expression: "AVG(avg_cpu_busy_pct)"
+    peak_cpu_utilization:
+      type: decimal
+      description: "Maximum CPU busy percentage"
+      expression: "MAX(max_cpu_busy_pct)"
+    avg_io_wait:
+      type: decimal
+      description: "Average IO wait percentage"
+      expression: "AVG(max_iowait_pct)"
+    avg_pm_cod:
+      type: decimal
+      description: "Average PM COD percentage"
+      expression: "AVG(pm_cod_pct)"
+    avg_wm_cod:
+      type: decimal
+      description: "Average WM COD percentage"
+      expression: "AVG(wm_cod_pct)"
+    days_sampled:
+      type: integer
+      description: "Number of distinct days in the sample"
+      expression: "COUNT(DISTINCT log_dt)"
+
+  sql: |
+    with join_date as (
+        select db.cust_site_id, max(db.log_dt) as max_log_dt 
+        from acc_ted_con_vw.dbp_resUsage_szng_agg db 
+            INNER JOIN ACC_TED_CON_VW.dbp_snow_site_dim snow
+            ON db.cust_site_id = snow.cust_site_id
+        where (:cust_site_id IS NULL OR db.cust_site_id = :cust_site_id)
+        and snow.gtm_acct_nbr = :account_nbr
+        and snow.status_desc IN ( 'Active', 'Operational' )
+        group by 1
+    )
+    select 
+        sz.cust_site_id,
+        sz.log_dow as day_of_week,
+        sz.log_hr as hour_of_day,
+        sz.avg_cpu_busy_pct,
+        sz.max_cpu_busy_pct,
+        sz.max_iowait_pct,
+        sz.pm_cod_pct,
+        sz.wm_cod_pct,
+        sz.log_dt
+    from acc_ted_con_vw.dbp_resUsage_szng_agg sz
+      INNER JOIN join_date dt
+      ON sz.log_dt between dt.max_log_dt - 29 and dt.max_log_dt
+      and sz.cust_site_id = dt.cust_site_id
+    
+  parameters:
+    account_nbr:
+      description: "GTM account number for the account to search in TCA"
+    cust_site_id: 
+      description: "Teradata site id for the customer site (optional - NULL for all sites)"
+
+# NOTE: Avoid characters like "(" and ")" in your glossary term and synonyms as it currently breaks the code
+tca_glossary:
+  type: glossary
+  
+  total_amp_cpu_seconds: 
+    definition: "Cumulative CPU processing time across all Access Module Processors (AMPs) for a query. 
+      Represents computational intensity, not wall-clock runtime. 
+      For example, a query consuming 18 AMP CPU seconds can still complete in sub-second response time due to parallel processing."
+    synonyms:
+      - AMP CPU time
+      - amp_cpu_tm_sec_qty     
+      - tot_ampcputime
+      - AMP CPU seconds 
+      - AmpCPUTime
